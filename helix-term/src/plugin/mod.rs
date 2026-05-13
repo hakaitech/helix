@@ -28,6 +28,8 @@ use crate::config::PluginsConfig;
 
 pub(crate) mod scope;
 #[cfg(feature = "steel")]
+mod events;
+#[cfg(feature = "steel")]
 mod steel;
 
 /// Engine alias chosen at compile time. With the `steel` feature this is the
@@ -143,6 +145,36 @@ impl ScriptingHost {
         HOST.get().map(|h| h.read().engine.is_some()).unwrap_or(false)
     }
 
+    /// Fire every script-side hook registered against `event_name`. Called
+    /// by the typed hook bridges in `events::install_typed_hooks`. Caller
+    /// is expected to already be inside [`scope::scope`].
+    ///
+    /// Errors are logged but never propagated — a misbehaving plugin
+    /// should not break the editor's event dispatch loop.
+    #[cfg(feature = "steel")]
+    pub(super) fn fire_hooks(event_name: &'static str) {
+        let Some(host) = HOST.get() else { return; };
+        // Drop the lock around the script call. We re-acquire on each
+        // callable to keep the critical section short.
+        let keys: Vec<u64> = {
+            let guard = host.read();
+            let Some(engine) = guard.engine.as_ref() else { return; };
+            engine.hook_keys(event_name)
+        };
+        for key in keys {
+            let mut guard = host.write();
+            let Some(engine) = guard.engine.as_mut() else { return; };
+            if let Err(err) = engine.call_hook(key) {
+                log::error!(
+                    "plugin hook for {event_name} failed: {err}; subsequent hooks for this event still fire"
+                );
+            }
+        }
+    }
+
+    #[cfg(not(feature = "steel"))]
+    pub(super) fn fire_hooks(_event_name: &'static str) {}
+
     #[cfg(feature = "steel")]
     fn init_inner(cfg: &PluginsConfig, editor: &mut helix_view::Editor) -> Result<()> {
         // Install singleton with an empty engine first so call_command and
@@ -155,6 +187,12 @@ impl ScriptingHost {
                 plugins_config: Some(cfg.clone()),
             })
         });
+        // Install typed event-hook bridges exactly once per process. The
+        // helix-event registry has no unregister mechanism, so re-running
+        // init (impossible here because HOST is OnceLock, but conceptually)
+        // must not duplicate bridges. `OnceLock::get_or_init` makes init
+        // idempotent for us.
+        events::install_typed_hooks();
         Self::populate_inner(cfg, editor, cell)
     }
 
@@ -196,11 +234,19 @@ impl ScriptingHost {
             guard.typables.insert(cmd.name.clone(), cmd);
         }
         let count = guard.typables.len();
+        // Surface how many hooks the engine has registered too — useful
+        // for spotting silent registration failures during `:plugin-reload`.
+        let hook_summary = guard
+            .engine
+            .as_ref()
+            .map(|e| e.hook_summary())
+            .unwrap_or_default();
         drop(guard);
 
         log::info!(
-            "plugin host: steel engine initialised, {count} command{} registered",
-            if count == 1 { "" } else { "s" }
+            "plugin host: steel engine initialised, {count} command{} registered, hooks: {}",
+            if count == 1 { "" } else { "s" },
+            if hook_summary.is_empty() { "(none)".to_string() } else { hook_summary }
         );
         Ok(())
     }

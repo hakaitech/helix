@@ -15,13 +15,14 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use parking_lot::Mutex;
-use slotmap::{new_key_type, SlotMap};
+use slotmap::{new_key_type, Key, KeyData, SlotMap};
 use steel::rvals::SteelVal;
 use steel::steel_vm::engine::Engine;
 // `register_fn` is supplied by a trait that lives in a separate module.
 // Importing it brings the method into scope on `Engine`.
 use steel::steel_vm::register_fn::RegisterFn;
 
+use super::events::SUPPORTED_EVENTS;
 use super::scope::with_editor;
 use super::PluginCommand;
 
@@ -42,6 +43,9 @@ struct SharedState {
     callables: SlotMap<CallableKey, SteelVal>,
     pending_commands: Vec<PluginCommand>,
     command_keys: HashMap<String, CallableKey>,
+    /// Script-registered event hooks, keyed by event name. Multiple hooks
+    /// per event are supported; they fire in registration order.
+    event_hooks: HashMap<String, Vec<CallableKey>>,
 }
 
 pub struct SteelEngine {
@@ -55,6 +59,9 @@ impl SteelEngine {
         let state = Arc::new(Mutex::new(SharedState::default()));
         register_logging_bindings(&mut inner);
         register_command_bindings(&mut inner, &state);
+        register_hook_bindings(&mut inner, &state);
+        register_document_bindings(&mut inner);
+        register_state_bindings(&mut inner);
         Ok(Self { inner, state })
     }
 
@@ -99,13 +106,55 @@ impl SteelEngine {
                 .cloned()
                 .ok_or_else(|| anyhow::anyhow!("plugin command callable is stale"))?
         };
-        // Steel's call_function_with_args wants `Vec<SteelVal>`. We pass an
-        // empty vector for slice 2; arg-passing comes with slice 3 once we
-        // also need to marshal payload data into event hooks.
         self.inner
             .call_function_with_args(callable, Vec::new())
             .map(|_| ())
             .map_err(|e| anyhow::anyhow!("plugin '{name}' raised: {e}"))
+    }
+
+    /// Human-readable summary of registered event hooks, e.g.
+    /// `"DocumentDidOpen:1, OnModeSwitch:2"`. Surfaced in the init log so
+    /// users can sanity-check that their hooks bound where they expected.
+    pub fn hook_summary(&self) -> String {
+        let state = self.state.lock();
+        let mut parts: Vec<_> = state
+            .event_hooks
+            .iter()
+            .map(|(name, keys)| format!("{name}:{}", keys.len()))
+            .collect();
+        parts.sort();
+        parts.join(", ")
+    }
+
+    /// Return the opaque keys of every hook registered against an event
+    /// name. The host iterates over these and calls `call_hook` per key.
+    /// Encoded as `u64` so the host doesn't need to know about
+    /// `CallableKey`.
+    pub fn hook_keys(&self, event_name: &str) -> Vec<u64> {
+        let state = self.state.lock();
+        state
+            .event_hooks
+            .get(event_name)
+            .map(|keys| keys.iter().map(|k| k.data().as_ffi()).collect())
+            .unwrap_or_default()
+    }
+
+    /// Invoke a previously stored hook callable. The host passes a key
+    /// obtained from [`Self::hook_keys`].
+    pub fn call_hook(&mut self, key: u64) -> Result<()> {
+        let callable = {
+            let state = self.state.lock();
+            let key = CallableKey::from(KeyData::from_ffi(key));
+            state
+                .callables
+                .get(key)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("plugin hook callable is stale"))?
+        };
+        self.inner
+            .call_function_with_args(callable, Vec::new())
+            .map(|_| ())
+            .map_err(|e| anyhow::anyhow!("plugin hook raised: {e}"))
     }
 }
 
@@ -156,6 +205,122 @@ fn register_command_bindings(engine: &mut Engine, state: &Arc<Mutex<SharedState>
     );
 }
 
+/// Register `helix.register-hook`. Script signature:
+///   `(helix.register-hook event-name callable)`
+///
+/// where `event-name` is one of the strings in
+/// [`super::events::SUPPORTED_EVENTS`]. Unknown event names are rejected
+/// loudly via `helix.error` — a typo here would otherwise silently never
+/// fire and be very confusing to debug.
+fn register_hook_bindings(engine: &mut Engine, state: &Arc<Mutex<SharedState>>) {
+    let state = Arc::clone(state);
+    engine.register_fn(
+        "helix.register-hook",
+        move |event_name: String, callable: SteelVal| {
+            if !SUPPORTED_EVENTS.contains(&event_name.as_str()) {
+                let supported = SUPPORTED_EVENTS.join(", ");
+                // We cannot return Result from a register_fn closure in a
+                // way that propagates back into the Scheme error system
+                // generically — easiest path is to log and surface via the
+                // editor status. The script keeps running; the missing
+                // registration will be obvious to the user.
+                log::error!(
+                    "helix.register-hook: unknown event '{event_name}'. Supported: {supported}"
+                );
+                with_editor(|editor| {
+                    editor.set_error(format!(
+                        "plugin: unknown event '{event_name}' (supported: {supported})"
+                    ))
+                });
+                return;
+            }
+            let mut guard = state.lock();
+            let key = guard.callables.insert(callable);
+            guard.event_hooks.entry(event_name).or_default().push(key);
+        },
+    );
+}
+
+/// Register bindings that read or mutate the current document.
+///
+/// All editor accesses go through [`with_editor`] — these functions are
+/// only safe to call from inside [`super::scope::scope`]; outside of one
+/// they panic. That's a host-level invariant (every entry point from
+/// script-land must establish a scope first).
+fn register_document_bindings(engine: &mut Engine) {
+    engine.register_fn("doc/text", || -> String {
+        with_editor(|editor| {
+            let (_, doc) = current_ref!(editor);
+            doc.text().to_string()
+        })
+    });
+
+    engine.register_fn("doc/path", || -> String {
+        with_editor(|editor| {
+            let (_, doc) = current_ref!(editor);
+            doc.path()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default()
+        })
+    });
+
+    engine.register_fn("doc/line-count", || -> usize {
+        with_editor(|editor| {
+            let (_, doc) = current_ref!(editor);
+            doc.text().len_lines()
+        })
+    });
+
+    engine.register_fn("doc/insert", |text: String| {
+        with_editor(|editor| {
+            let (view, doc) = current!(editor);
+            let tx = helix_core::Transaction::insert(
+                doc.text(),
+                &doc.selection(view.id).clone(),
+                text.into(),
+            );
+            doc.apply(&tx, view.id);
+        });
+    });
+
+    engine.register_fn("sel/primary-anchor", || -> usize {
+        with_editor(|editor| {
+            let (view, doc) = current_ref!(editor);
+            doc.selection(view.id).primary().anchor
+        })
+    });
+
+    engine.register_fn("sel/primary-head", || -> usize {
+        with_editor(|editor| {
+            let (view, doc) = current_ref!(editor);
+            doc.selection(view.id).primary().head
+        })
+    });
+}
+
+/// Register bindings that report editor state outside of any specific
+/// document — useful inside event hooks where the script wants to know
+/// which mode it's in / which doc fired the event.
+fn register_state_bindings(engine: &mut Engine) {
+    engine.register_fn("helix.current-mode", || -> String {
+        with_editor(|editor| match editor.mode() {
+            helix_view::document::Mode::Normal => "normal".to_string(),
+            helix_view::document::Mode::Insert => "insert".to_string(),
+            helix_view::document::Mode::Select => "select".to_string(),
+        })
+    });
+
+    engine.register_fn("helix.current-doc-id", || -> u64 {
+        with_editor(|editor| {
+            let (_, doc) = current_ref!(editor);
+            // DocumentId wraps NonZeroUsize. We expose it as a u64 for
+            // Scheme-side identity checks ("did THIS document change?").
+            // Stable for the document's lifetime.
+            doc.id().to_string().parse::<u64>().unwrap_or(0)
+        })
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -192,6 +357,82 @@ mod tests {
         // A second drain on the same engine returns nothing — the queue
         // is single-shot per registration burst.
         assert!(engine.drain_pending_commands().is_empty());
+    }
+
+    /// End-to-end verification that the stored callable survives the
+    /// round-trip from Steel → slotmap → call_hook → Steel. This is the
+    /// critical correctness property for slice 3: the typed `register_hook!`
+    /// bridge in events.rs calls `ScriptingHost::fire_hooks`, which calls
+    /// `engine.call_hook(key)`. If that path is broken at any layer, hooks
+    /// silently never run.
+    ///
+    /// The script-side closure mutates a Steel-side counter so we can
+    /// observe whether the body actually ran. Reads back the counter via
+    /// `(begin counter)` evaluating to the current value.
+    #[test]
+    fn call_hook_runs_the_stored_callable_body() {
+        let mut engine = SteelEngine::new().expect("engine init");
+        engine
+            .inner
+            .compile_and_run_raw_program(
+                r#"
+                (define counter 0)
+                (helix.register-hook "OnModeSwitch"
+                                     (lambda () (set! counter (+ counter 1))))
+                "#,
+            )
+            .expect("setup script");
+
+        let keys = engine.hook_keys("OnModeSwitch");
+        assert_eq!(keys.len(), 1);
+
+        engine.call_hook(keys[0]).expect("first invocation");
+        engine.call_hook(keys[0]).expect("second invocation");
+        engine.call_hook(keys[0]).expect("third invocation");
+
+        // Re-evaluate `counter` to read its current value.
+        let result = engine
+            .inner
+            .compile_and_run_raw_program("counter")
+            .expect("read counter");
+        let last = result.last().expect("at least one value");
+        match last {
+            SteelVal::IntV(n) => assert_eq!(*n, 3, "counter should be 3 after 3 fires"),
+            other => panic!("expected IntV(3), got {other:?}"),
+        }
+    }
+
+    /// Hook registration stores keys under the event name and exposes
+    /// them via hook_keys. Unknown event names are rejected silently (we
+    /// can't propagate the error through Steel's register_fn return path
+    /// cleanly, but we log + status-bar it).
+    #[test]
+    fn register_hook_stores_callable_under_event_name() {
+        let mut engine = SteelEngine::new().expect("engine init");
+        engine
+            .inner
+            .compile_and_run_raw_program(
+                r#"
+                (helix.register-hook "DocumentDidOpen"
+                                     (lambda () (helix.log "doc opened")))
+                (helix.register-hook "DocumentDidOpen"
+                                     (lambda () (helix.log "second doc-open handler")))
+                (helix.register-hook "PostCommand"
+                                     (lambda () (helix.log "post command")))
+                "#,
+            )
+            .expect("script ran");
+
+        let open_keys = engine.hook_keys("DocumentDidOpen");
+        assert_eq!(
+            open_keys.len(),
+            2,
+            "both DocumentDidOpen hooks should register"
+        );
+        let post_keys = engine.hook_keys("PostCommand");
+        assert_eq!(post_keys.len(), 1);
+        // No registrations for events the script didn't subscribe to.
+        assert!(engine.hook_keys("OnModeSwitch").is_empty());
     }
 
     /// Re-registering the same name keeps the most recent callable and
