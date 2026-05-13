@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::fmt::Display;
 use std::fs;
 use std::io::Error as IOError;
+use std::path::PathBuf;
 use toml::de::Error as TomlError;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -14,6 +15,37 @@ pub struct Config {
     pub theme: Option<theme::Config>,
     pub keys: HashMap<Mode, KeyTrie>,
     pub editor: helix_view::editor::Config,
+    /// Scripting / plugin host configuration. Absent in the default config
+    /// — the plugin host is opt-in.
+    pub plugins: Option<PluginsConfig>,
+}
+
+/// Configuration for the embedded plugin host. Mapped 1:1 from the
+/// `[plugins]` table in `config.toml`.
+#[derive(Debug, Clone, PartialEq, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct PluginsConfig {
+    /// Path to the user's plugin entry script. Resolved relative to the
+    /// helix config directory unless absolute. Leading `~` is expanded.
+    /// If omitted, the host is initialised with no user scripts loaded.
+    #[serde(default, deserialize_with = "deserialize_optional_path")]
+    pub init: Option<PathBuf>,
+}
+
+fn deserialize_optional_path<'de, D>(de: D) -> Result<Option<PathBuf>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let opt: Option<String> = Option::deserialize(de)?;
+    Ok(opt.map(|s| {
+        let expanded = helix_stdx::path::expand_tilde(std::path::Path::new(&s));
+        let path = expanded.as_ref();
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            helix_loader::config_dir().join(path)
+        }
+    }))
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -22,6 +54,7 @@ pub struct ConfigRaw {
     pub theme: Option<theme::Config>,
     pub keys: Option<HashMap<Mode, KeyTrie>>,
     pub editor: Option<toml::Value>,
+    pub plugins: Option<PluginsConfig>,
 }
 
 impl Default for Config {
@@ -30,6 +63,7 @@ impl Default for Config {
             theme: None,
             keys: keymap::default(),
             editor: helix_view::editor::Config::default(),
+            plugins: None,
         }
     }
 }
@@ -88,6 +122,10 @@ impl Config {
                     theme: local.theme.or(global.theme),
                     keys,
                     editor,
+                    // Local overrides global wholesale — the [plugins] table
+                    // is small and per-user, merging it semantically would
+                    // be more surprising than the last-one-wins rule.
+                    plugins: local.plugins.or(global.plugins),
                 }
             }
             // if any configs are invalid return that first
@@ -107,6 +145,7 @@ impl Config {
                         || Ok(helix_view::editor::Config::default()),
                         |val| val.try_into().map_err(ConfigLoadError::BadConfig),
                     )?,
+                    plugins: config.plugins,
                 }
             }
 

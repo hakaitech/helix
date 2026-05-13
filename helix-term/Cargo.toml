@@ -35,6 +35,11 @@ default = ["git"]
 unicode-lines = ["helix-core/unicode-lines", "helix-view/unicode-lines"]
 integration = ["helix-event/integration_test"]
 git = ["helix-vcs/git"]
+# Embed the Steel Scheme interpreter as a scripting/plugin engine.
+# When disabled (the default), the plugin module compiles to a no-op stub
+# and the resulting `hx` binary is byte-identical in behaviour to vanilla
+# Helix.
+steel = ["dep:steel-core"]
 
 [[bin]]
 name = "hx"
@@ -93,6 +98,10 @@ serde = { version = "1.0", features = ["derive"] }
 dashmap = "6.0"
 
 parking_lot.workspace = true
+slotmap.workspace = true
+
+# Optional scripting engine — see the `steel` feature above.
+steel-core = { git = "https://github.com/mattwparas/steel.git", rev = "b67efd5c262962226424148bb87abefaf4109c5a", features = ["anyhow", "sync"], optional = true }
 
 [target.'cfg(windows)'.dependencies]
 crossterm = { version = "0.28", features = ["event-stream"] }

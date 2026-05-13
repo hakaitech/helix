@@ -239,6 +239,20 @@ impl Application {
                 .unwrap_or_else(|_| editor.new_file(Action::VerticalSplit));
         }
 
+        // Initialise the plugin host after files have been opened so that
+        // `init.scm` sees a fully-formed editor. If init fails we log it
+        // and surface a status error but do not abort startup — a bad
+        // plugin should never deny the user their editor.
+        {
+            let snapshot = config.load();
+            if let Err(err) =
+                crate::plugin::ScriptingHost::init(snapshot.plugins.as_ref(), &mut editor)
+            {
+                log::error!("plugin host init failed: {err:#}");
+                editor.set_error(format!("plugin host init failed: {err}"));
+            }
+        }
+
         #[cfg(windows)]
         let signals = futures_util::stream::empty();
         #[cfg(not(windows))]
