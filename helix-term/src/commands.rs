@@ -203,13 +203,18 @@ use helix_view::{align_view, Align};
 /// MappableCommands are commands that can be bound to keys, executable in
 /// normal, insert or select mode.
 ///
-/// There are three kinds:
+/// There are four kinds:
 ///
 /// * Static: commands usually bound to keys and used for editing, movement,
 ///   etc., for example `move_char_left`.
 /// * Typable: commands executable from command mode, prefixed with a `:`,
 ///   for example `:write!`.
 /// * Macro: a sequence of keys to execute, for example `@miw`.
+/// * Plugin: a script-registered command, prefixed with `plugin:` in TOML,
+///   resolved lazily at execute time. The plugin host may not have loaded
+///   yet (it runs after `Config::load_default`), so we must accept these
+///   strings at parse time and only fail when the user actually presses
+///   the key.
 #[derive(Clone)]
 pub enum MappableCommand {
     Typable {
@@ -225,6 +230,12 @@ pub enum MappableCommand {
     Macro {
         name: String,
         keys: Vec<KeyEvent>,
+    },
+    Plugin {
+        /// Script-side name, without the `plugin:` prefix.
+        name: String,
+        /// Placeholder doc until the plugin host registers a real one.
+        doc: String,
     },
 }
 
@@ -265,6 +276,11 @@ impl MappableCommand {
                 }
             }
             Self::Static { fun, .. } => (fun)(cx),
+            Self::Plugin { name, .. } => {
+                if let Err(e) = crate::plugin::ScriptingHost::call_command(name, cx) {
+                    cx.editor.set_error(format!("plugin '{name}': {e}"));
+                }
+            }
             Self::Macro { keys, .. } => {
                 // Protect against recursive macros.
                 if cx.editor.macro_replaying.contains(&'@') {
@@ -290,6 +306,7 @@ impl MappableCommand {
             Self::Typable { name, .. } => name,
             Self::Static { name, .. } => name,
             Self::Macro { name, .. } => name,
+            Self::Plugin { name, .. } => name,
         }
     }
 
@@ -298,6 +315,7 @@ impl MappableCommand {
             Self::Typable { doc, .. } => doc,
             Self::Static { doc, .. } => doc,
             Self::Macro { name, .. } => name,
+            Self::Plugin { doc, .. } => doc,
         }
     }
 
@@ -635,6 +653,10 @@ impl fmt::Debug for MappableCommand {
                 .field(name)
                 .field(keys)
                 .finish(),
+            MappableCommand::Plugin { name, .. } => f
+                .debug_tuple("MappableCommand")
+                .field(&format_args!("plugin:{name}"))
+                .finish(),
         }
     }
 }
@@ -667,6 +689,18 @@ impl std::str::FromStr for MappableCommand {
                     }
                 })
                 .ok_or_else(|| anyhow!("No TypableCommand named '{}'", s))
+        } else if let Some(name) = s.strip_prefix("plugin:") {
+            // The plugin host is constructed in `Application::new`, which
+            // runs *after* `Config::load_default` deserialises this keymap.
+            // We can therefore never resolve the command at parse time —
+            // we accept the name now and defer the existence check to
+            // `MappableCommand::execute`. If no plugin ends up registering
+            // it, the user gets a `set_error` when they press the key.
+            ensure!(!name.is_empty(), "Expected plugin command name after 'plugin:'");
+            Ok(MappableCommand::Plugin {
+                name: name.to_string(),
+                doc: format!("(plugin command: {name})"),
+            })
         } else if let Some(suffix) = s.strip_prefix('@') {
             helix_view::input::parse_macro(suffix).map(|keys| Self::Macro {
                 name: s.to_string(),
@@ -712,6 +746,14 @@ impl PartialEq for MappableCommand {
                     name: first_name, ..
                 },
                 MappableCommand::Static {
+                    name: second_name, ..
+                },
+            ) => first_name == second_name,
+            (
+                MappableCommand::Plugin {
+                    name: first_name, ..
+                },
+                MappableCommand::Plugin {
                     name: second_name, ..
                 },
             ) => first_name == second_name,
@@ -3578,6 +3620,7 @@ pub fn command_palette(cx: &mut Context) {
                 ui::PickerColumn::new("name", |item, _| match item {
                     MappableCommand::Typable { name, .. } => format!(":{name}").into(),
                     MappableCommand::Static { name, .. } => (*name).into(),
+                    MappableCommand::Plugin { name, .. } => format!("plugin:{name}").into(),
                     MappableCommand::Macro { .. } => {
                         unreachable!("macros aren't included in the command palette")
                     }

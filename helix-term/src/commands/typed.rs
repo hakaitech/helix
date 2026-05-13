@@ -3991,6 +3991,22 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         fun: untrust_workspace,
         completer: CommandCompleter::none(),
         signature: Signature { positionals: (0, None), ..Signature::DEFAULT },
+    },
+    TypableCommand {
+        name: "plugin-reload",
+        aliases: &[],
+        doc: "Reload the embedded plugin engine and re-evaluate init.scm.",
+        fun: plugin_reload,
+        completer: CommandCompleter::none(),
+        signature: Signature { positionals: (0, None), ..Signature::DEFAULT },
+    },
+    TypableCommand {
+        name: "plugin-list",
+        aliases: &[],
+        doc: "List script-registered plugin commands.",
+        fun: plugin_list,
+        completer: CommandCompleter::none(),
+        signature: Signature { positionals: (0, None), ..Signature::DEFAULT },
     }
 ];
 
@@ -4448,5 +4464,51 @@ fn untrust_workspace(
     }
 
     helix_loader::workspace_trust::WorkspaceTrust::load(false).untrust_workspace();
+    Ok(())
+}
+
+fn plugin_reload(
+    cx: &mut compositor::Context,
+    _args: Args<'_>,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+    match crate::plugin::ScriptingHost::reload(cx.editor) {
+        Ok(()) => {
+            cx.editor.set_status("plugin engine reloaded");
+            Ok(())
+        }
+        Err(e) => {
+            cx.editor.set_error(format!("plugin reload failed: {e}"));
+            // Returning Err would double-set the error; the editor message
+            // is enough.
+            Ok(())
+        }
+    }
+}
+
+fn plugin_list(
+    cx: &mut compositor::Context,
+    _args: Args<'_>,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+    let cmds = crate::plugin::ScriptingHost::list_commands();
+    if cmds.is_empty() {
+        cx.editor.set_status("no plugin commands registered");
+    } else {
+        let mut buf = String::from("plugin commands: ");
+        for (i, cmd) in cmds.iter().enumerate() {
+            if i > 0 {
+                buf.push_str(", ");
+            }
+            buf.push_str(&cmd.name);
+        }
+        cx.editor.set_status(buf);
+    }
     Ok(())
 }
