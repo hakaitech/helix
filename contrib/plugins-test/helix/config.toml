@@ -1,0 +1,11 @@
+[editor]
+insecure = true
+
+[keys.normal.space]
+p = "plugin:say-hi"
+l = "plugin:show-info"
+r = ":plugin-reload"
+b = ":plugin-list"
+
+[plugins]
+init = "init.scm"
